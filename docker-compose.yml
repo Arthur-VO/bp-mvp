@@ -1,0 +1,37 @@
+services:
+  # Target: Insecure Fintech MCP Server
+  goat-server:
+    build:
+      context: ./goat-server
+      dockerfile: Dockerfile
+    container_name: mcp-goat
+    ports:
+      - "8080:8080" # Map poort 8080 naar de host voor manuele inspectie
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+      - ENVIRONMENT=development
+    networks:
+      - mcp-lab-net
+    restart: unless-stopped
+
+  # Attacker: Security Assessment Framework
+  scanner:
+    build:
+      context: ./scanner
+      dockerfile: Dockerfile
+    container_name: mcp-scanner
+    depends_on:
+      - goat-server
+    environment:
+      - TARGET_MCP_URL=http://goat-server:8080/sse
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./scanner/reports:/app/reports
+    networks:
+      - mcp-lab-net
+    restart: "no"
+
+networks:
+  mcp-lab-net:
+    driver: bridge
