@@ -63,8 +63,31 @@ docker compose down
 ## Huidige status (MVP in opbouw)
 
 - `README.md` en `roadmap.md` zijn aanwezig.
-- Basis Dockerfiles zijn aanwezig in `goat/` en `scanner/`.
-- Verdere implementatiebestanden (zoals server/client code en `requirements.txt`) moeten nog toegevoegd worden volgens de roadmap.
+- Werkende Goat-server in `goat/server.py` met endpoints `/health`, `/sse` en `/rpc`.
+- Werkende scanner in `scanner/client.py` die discovery uitvoert (`list_tools`, `list_prompts`, `list_resources`).
+- Dependencies en entrypoints zijn geconfigureerd via de Dockerfiles en `requirements.txt` bestanden.
+- Scanresultaten worden geschreven naar `scanner/reports/discovery-report.json` en `scanner/reports/discovery-report.md`.
+
+## Voorbeeldrun
+
+```bash
+docker compose up --build --abort-on-container-exit --exit-code-from scanner
+```
+
+Na een succesvolle run bevat de scanner-output regels zoals:
+
+- `[scanner] Discovery done. tools=... prompts=... resources=...`
+- `[scanner] Reports written to /app/reports`
+
+## Troubleshooting (Linux)
+
+Als Docker faalt met `docker-credential-desktop` (credential helper ontbreekt), gebruik tijdelijk:
+
+```bash
+mkdir -p .docker-tmp
+printf '{}' > .docker-tmp/config.json
+DOCKER_CONFIG=$PWD/.docker-tmp docker compose up --build
+```
 
 ## Roadmap
 
