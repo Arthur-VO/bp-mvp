@@ -2,7 +2,7 @@ services:
   # Target: Insecure Fintech MCP Server
   goat-server:
     build:
-      context: ./goat-server
+      context: ./goat
       dockerfile: Dockerfile
     container_name: mcp-goat
     ports:
