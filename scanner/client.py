@@ -6,24 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from pydantic import BaseModel
 
-
-class MCPTool(BaseModel):
-    name: str
-    description: str
-    inputSchema: dict[str, Any] = {}
-
-
-class MCPPrompt(BaseModel):
-    name: str
-    description: str | None = None
-
-
-class MCPResource(BaseModel):
-    uri: str
-    name: str | None = None
-    mimeType: str | None = None
+from models import MCPPrompt, MCPResource, MCPTool
+from sast import Finding, run_sast
 
 
 def rpc_call(client: httpx.Client, rpc_url: str, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -59,7 +44,7 @@ def wait_for_target(client: httpx.Client, base_url: str, attempts: int = 20, del
     raise RuntimeError(f"Target did not become ready at {health_url}: {last_error}")
 
 
-def run_discovery(target_base_url: str, output_dir: Path) -> dict[str, Any]:
+def run_discovery(target_base_url: str) -> tuple[list[MCPTool], list[MCPPrompt], list[MCPResource], str]:
     rpc_url = f"{target_base_url.rstrip('/')}/rpc"
     sse_url = f"{target_base_url.rstrip('/')}/sse"
 
@@ -77,11 +62,41 @@ def run_discovery(target_base_url: str, output_dir: Path) -> dict[str, Any]:
         prompts_raw = rpc_call(client, rpc_url, "list_prompts").get("prompts", [])
         resources_raw = rpc_call(client, rpc_url, "list_resources").get("resources", [])
 
-    tools = [MCPTool.model_validate(item).model_dump() for item in tools_raw]
-    prompts = [MCPPrompt.model_validate(item).model_dump() for item in prompts_raw]
-    resources = [MCPResource.model_validate(item).model_dump() for item in resources_raw]
+    tools = [MCPTool.model_validate(item) for item in tools_raw]
+    prompts = [MCPPrompt.model_validate(item) for item in prompts_raw]
+    resources = [MCPResource.model_validate(item) for item in resources_raw]
 
-    report = {
+    return tools, prompts, resources, sse_status
+
+
+def _severity_order(finding: Finding) -> int:
+    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+    return order.get(finding.severity.value, 99)
+
+
+def write_reports(
+    target_base_url: str,
+    tools: list[MCPTool],
+    prompts: list[MCPPrompt],
+    resources: list[MCPResource],
+    sse_status: str,
+    sast_findings: list[Finding],
+    fuzz_findings: list[Finding],
+    output_dir: Path,
+) -> dict[str, Any]:
+    sast_sorted = sorted(sast_findings, key=_severity_order)
+    fuzz_sorted = sorted(fuzz_findings, key=_severity_order)
+
+    def _section(findings: list[Finding]) -> dict[str, Any]:
+        return {
+            "finding_count": len(findings),
+            "high": sum(1 for f in findings if f.severity.value == "HIGH"),
+            "medium": sum(1 for f in findings if f.severity.value == "MEDIUM"),
+            "low": sum(1 for f in findings if f.severity.value == "LOW"),
+            "findings": [f.model_dump() for f in findings],
+        }
+
+    report: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "target": target_base_url,
         "discovery": {
@@ -89,45 +104,108 @@ def run_discovery(target_base_url: str, output_dir: Path) -> dict[str, Any]:
             "tool_count": len(tools),
             "prompt_count": len(prompts),
             "resource_count": len(resources),
-            "tools": tools,
-            "prompts": prompts,
-            "resources": resources,
+            "tools": [t.model_dump() for t in tools],
+            "prompts": [p.model_dump() for p in prompts],
+            "resources": [r.model_dump() for r in resources],
         },
+        "sast": _section(sast_sorted),
+        "fuzzing": _section(fuzz_sorted),
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    json_path = output_dir / "discovery-report.json"
-    md_path = output_dir / "discovery-report.md"
+    json_path = output_dir / "report.json"
+    md_path = output_dir / "report.md"
 
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    md_lines = [
-        "# Discovery Report",
+    _write_markdown(report, tools, prompts, resources, sast_sorted, fuzz_sorted, md_path)
+
+    return report
+
+
+def _findings_block(findings: list[Finding]) -> list[str]:
+    if not findings:
+        return ["Geen bevindingen."]
+    lines: list[str] = []
+    badge_map = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡", "INFO": "🔵"}
+    for f in findings:
+        badge = badge_map.get(f.severity.value, "")
+        lines += [
+            f"### {badge} [{f.rule_id}] {f.title}",
+            "",
+            f"- **Severity**: {f.severity.value}",
+            f"- **Tool**: `{f.tool_name}`",
+            f"- **Detail**: {f.detail}",
+            "",
+        ]
+    return lines
+
+
+def _write_markdown(
+    report: dict[str, Any],
+    tools: list[MCPTool],
+    prompts: list[MCPPrompt],
+    resources: list[MCPResource],
+    sast_findings: list[Finding],
+    fuzz_findings: list[Finding],
+    md_path: Path,
+) -> None:
+    sast = report["sast"]
+    fuzzing = report["fuzzing"]
+
+    lines: list[str] = [
+        "# MCP Security Assessment Report",
         "",
         f"- **Timestamp**: {report['timestamp']}",
-        f"- **Target**: {target_base_url}",
-        f"- **SSE status**: {sse_status}",
-        f"- **Tools**: {len(tools)}",
-        f"- **Prompts**: {len(prompts)}",
-        f"- **Resources**: {len(resources)}",
+        f"- **Target**: {report['target']}",
+        f"- **SSE status**: {report['discovery']['sse']}",
         "",
-        "## Tools",
+        "## Discovery",
+        "",
+        "| Type | Count |",
+        "|------|-------|",
+        f"| Tools | {len(tools)} |",
+        f"| Prompts | {len(prompts)} |",
+        f"| Resources | {len(resources)} |",
+        "",
+        "### Tools",
     ]
 
     for tool in tools:
-        md_lines.append(f"- `{tool['name']}`: {tool['description']}")
+        lines.append(f"- `{tool.name}`: {tool.description}")
 
-    md_lines.extend(["", "## Prompts"])
+    lines += ["", "### Prompts"]
     for prompt in prompts:
-        md_lines.append(f"- `{prompt['name']}`: {prompt.get('description') or 'n/a'}")
+        lines.append(f"- `{prompt.name}`: {prompt.description or 'n/a'}")
 
-    md_lines.extend(["", "## Resources"])
+    lines += ["", "### Resources"]
     for resource in resources:
-        md_lines.append(f"- `{resource.get('name') or resource['uri']}` ({resource['uri']})")
+        lines.append(f"- `{resource.name or resource.uri}` ({resource.uri})")
 
-    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    lines += [
+        "",
+        "---",
+        "",
+        "## SAST Findings",
+        "",
+        f"**{sast['finding_count']} bevindingen** — "
+        f"HIGH: {sast['high']} | MEDIUM: {sast['medium']} | LOW: {sast['low']}",
+        "",
+    ]
+    lines.extend(_findings_block(sast_findings))
 
-    return report
+    lines += [
+        "---",
+        "",
+        "## Fuzzing Findings",
+        "",
+        f"**{fuzzing['finding_count']} bevindingen** — "
+        f"HIGH: {fuzzing['high']} | MEDIUM: {fuzzing['medium']} | LOW: {fuzzing['low']}",
+        "",
+    ]
+    lines.extend(_findings_block(fuzz_findings))
+
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
@@ -136,14 +214,30 @@ def main() -> None:
     output_dir = Path(os.getenv("REPORT_DIR", "/app/reports"))
 
     print(f"[scanner] Starting discovery against {target_base}")
-    report = run_discovery(target_base, output_dir)
+    tools, prompts, resources, sse_status = run_discovery(target_base)
     print(
-        "[scanner] Discovery done. "
-        f"tools={report['discovery']['tool_count']} "
-        f"prompts={report['discovery']['prompt_count']} "
-        f"resources={report['discovery']['resource_count']}"
+        f"[scanner] Discovery done — tools={len(tools)} prompts={len(prompts)} resources={len(resources)}"
     )
-    print(f"[scanner] Reports written to {output_dir}")
+
+    print("[scanner] Running SAST analysis...")
+    sast_findings = run_sast(tools)
+    print(f"[scanner] SAST done — {len(sast_findings)} finding(s)")
+
+    print("[scanner] Running fuzzing analysis...")
+    from fuzzer import run_fuzzing
+    rpc_url = f"{target_base.rstrip('/')}/rpc"
+    fuzz_findings = run_fuzzing(rpc_url, tools)
+    print(f"[scanner] Fuzzing done — {len(fuzz_findings)} finding(s)")
+
+    report = write_reports(target_base, tools, prompts, resources, sse_status, sast_findings, fuzz_findings, output_dir)
+
+    sast = report["sast"]
+    fuzzing = report["fuzzing"]
+    print(
+        f"[scanner] SAST — HIGH={sast['high']} MEDIUM={sast['medium']} LOW={sast['low']} | "
+        f"FUZZ — HIGH={fuzzing['high']} MEDIUM={fuzzing['medium']} LOW={fuzzing['low']} | "
+        f"Reports written to {output_dir}"
+    )
 
 
 if __name__ == "__main__":
